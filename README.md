@@ -1,136 +1,168 @@
 # QueryWeave
 
-**Query-adaptive hybrid retrieval in Rust: lexical + sparse + dense + confidence-triggered reranking.**
+**A Rust-first, query-adaptive hybrid retrieval engine for lexical, sparse, dense and neural search.**
 
-QueryWeave is a Rust-first retrieval engine and research library designed to answer a practical question:
+QueryWeave is designed around one research and engineering question:
 
-> Can a search system match or improve always-on hybrid/reranking quality while spending less compute on easy queries?
+> Can a retrieval engine preserve or improve search quality while avoiding expensive dense, sparse and reranking stages when a query is already easy to answer?
 
-Instead of applying one fixed fusion recipe to every query, QueryWeave extracts query and retrieval signals, chooses a route, learns/derives per-query fusion weights, measures retriever disagreement, and only takes the expensive path when the evidence is ambiguous.
+Instead of applying one fixed hybrid formula to every query, QueryWeave analyzes the query and retrieval evidence, chooses a retrieval depth, dynamically fuses lexical/sparse/dense signals, measures retriever disagreement, and invokes deeper reranking only when confidence is weak.
 
-## Highlights
+## What makes QueryWeave different
 
-- **Rust core** with no unsafe code.
-- **BM25-style lexical retrieval** for exact terms, identifiers, entities and rare tokens.
-- **Dense retrieval** with a replaceable `VectorIndex` contract; the reference backend is exact cosine search for deterministic baselines.
-- **Sparse retrieval** with explicit sparse-vector input; Python plugins include a FastEmbed/SPLADE adapter.
-- **AQF — Adaptive Query Fusion** that changes lexical/sparse/dense weights from query characteristics and retrieval confidence.
-- **Retriever disagreement** measured from top-k overlap.
-- **Adaptive retrieval depth**: lexical early exit, hybrid fusion, or deep reranking.
-- **Late-interaction hook** with a deterministic built-in proxy and replaceable ColBERT/cross-encoder/LLM reranker contract.
-- **Metadata filtering** before scoring.
-- **Explainable results** with component scores, weights, route, features, candidate-pool size, and reranker decision.
-- **PyO3 native Python bindings** plus a pure-Python HTTP SDK.
-- **Python ML plugins** for dense embeddings, learned sparse encoders and rerankers.
-- **Axum HTTP service** for language-neutral integration.
-- **Benchmark tooling** for nDCG, MRR, Recall, latency and Pareto-frontier experiments.
+- **Rust adaptive retrieval core** with `#![forbid(unsafe_code)]` in QueryWeave crates.
+- **Tantivy BM25** production lexical backend.
+- **USearch HNSW** production ANN backend with F32 and I8 quantized modes.
+- **Exact cosine** and **built-in BM25-style** reference backends for deterministic ablations.
+- **Sparse-vector retrieval** compatible with SPLADE-style learned sparse representations.
+- **AQF — Adaptive Query Fusion** with per-query lexical/sparse/dense weights.
+- **Retriever-disagreement routing** based on top-k overlap.
+- **Adaptive retrieval depth**: lexical early exit → hybrid → deep reranking.
+- **Replaceable reranker contract** for ColBERT/MaxSim, cross-encoders, LLM rankers or enterprise services.
+- **Metadata pre-filtering**.
+- **Explainable results** including route, signal scores, AQF weights, backend names, confidence features and reranker decision.
+- **PyO3 native Python extension**.
+- **Pure-Python HTTP SDK**.
+- **Python model plugins** for dense encoders, learned sparse encoders and rerankers.
+- **FastEmbed BGE + SPLADE plugins** included as practical examples.
+- **Axum HTTP service** for Java/.NET/Go/Python/JS or remote consumers.
+- **Benchmark tooling** for nDCG, MRR, Recall, p50/p95/p99 latency and Pareto-frontier analysis.
 
 ## Architecture
 
 ```text
-                               query
+                               QUERY
                                  │
                                  ▼
-                    ┌────────────────────────┐
-                    │ Query feature analysis │
-                    └────────────┬───────────┘
+                       Query intelligence
                                  │
-              ┌──────────────────┼──────────────────┐
-              ▼                  ▼                  ▼
-        lexical/BM25        sparse/SPLADE        dense/vector
-              │                  │                  │
-              └──────────────────┼──────────────────┘
+               identifiers / length / rarity
+                                 │
+       ┌─────────────────────────┼─────────────────────────┐
+       ▼                         ▼                         ▼
+ Tantivy / BM25            Sparse / SPLADE          Dense / HNSW
+       │                         │                         │
+       └─────────────────────────┼─────────────────────────┘
                                  ▼
-                    retriever disagreement
+                      Retriever disagreement
                                  │
                                  ▼
-                       AQF adaptive fusion
+                        AQF adaptive fusion
                                  │
                     ┌────────────┴────────────┐
-                    │                         │
-               high confidence          ambiguous query
-                    │                         │
                     ▼                         ▼
-                 return              late interaction /
-                                     cross-encoder plugin
-                                             │
-                                             ▼
-                                           return
+              high confidence            ambiguous
+                    │                         │
+              early return              deep reranker
+                                              │
+                                              ▼
+                                      ColBERT / CE / LLM
 ```
 
-## AQF: Adaptive Query Fusion
+## AQF — Adaptive Query Fusion
 
-Fixed `0.5 * BM25 + 0.5 * dense` weights treat a CVE identifier and a natural-language semantic query as if they were the same retrieval problem. QueryWeave instead derives features including:
+Fixed fusion treats very different queries as the same problem. QueryWeave derives features such as:
 
-- query length;
+- token count;
 - numeric-token ratio;
 - identifier ratio;
 - rare-term ratio;
 - lexical top-result margin;
 - lexical-vs-dense top-k disagreement.
 
-The result is a normalized per-query weight vector:
+Initial deterministic priors are then adjusted using retrieval evidence. For example:
 
 ```text
-exact identifier       -> lexical 0.62 / sparse 0.28 / dense 0.10
-long semantic question -> lexical 0.18 / sparse 0.27 / dense 0.55
-mixed query            -> lexical 0.30 / sparse 0.30 / dense 0.40
+CVE-2026-12345                -> lexical-heavy
+industrial pump failure      -> balanced hybrid
+explain causes of pump wear  -> dense-heavy
+retrievers strongly disagree -> deeper fusion/reranking
 ```
 
-These are initial deterministic priors, not universal constants. The public score/fusion contracts are designed for learned weight predictors in later experiments.
+The deterministic policy is intentionally replaceable by a learned fusion predictor in future experiments while preserving the same explanation contract.
 
 ## Adaptive retrieval depth
 
-`mode="auto"` can take three paths:
+`mode="auto"` chooses among:
 
-1. **Lexical early exit** for high-confidence identifier/exact-term queries.
-2. **Hybrid** lexical+sparse+dense fusion for normal queries.
-3. **Deep** fusion + reranking when the retrievers disagree or confidence is weak.
+1. **Lexical early exit** — exact/identifier query with a strong lexical margin.
+2. **Hybrid** — lexical + sparse + dense AQF.
+3. **Deep** — AQF plus reranking when retrievers disagree or confidence is low.
 
-You can force a path with `lexical`, `hybrid`, or `deep` for ablations.
+For controlled experiments you can force:
 
-## Rust API
-
-```rust
-use queryweave_core::{Document, Metadata, QueryWeaveEngine, SearchMode, SearchRequest};
-
-let engine = QueryWeaveEngine::new();
-engine.upsert(vec![Document {
-    id: "doc-1".into(),
-    text: "Hydraulic pump temperature failure".into(),
-    source: "manual.pdf".into(),
-    metadata: Metadata::new(),
-    dense: None,   // built-in deterministic baseline if omitted
-    sparse: None,  // built-in deterministic baseline if omitted
-}]);
-
-let response = engine.search(SearchRequest {
-    query: "prevent pump failure caused by excessive heat".into(),
-    limit: 10,
-    mode: SearchMode::Auto,
-    dense: None,
-    sparse: None,
-    filter: Metadata::new(),
-    explain: true,
-});
+```text
+lexical
+hybrid
+deep
+auto
 ```
 
-For real semantic search, pass vectors generated by your production embedding and sparse models. QueryWeave does not force a model vendor.
+## Backend matrix
 
-## HTTP service
+The HTTP server defaults to the production-oriented configuration:
+
+```text
+QUERYWEAVE_LEXICAL_BACKEND=tantivy
+QUERYWEAVE_VECTOR_BACKEND=hnsw-f32
+```
+
+Available backends:
+
+| Layer | Backend | Purpose |
+|---|---|---|
+| lexical | `tantivy` | production BM25/inverted index |
+| lexical | `builtin` / `bm25` | deterministic lightweight baseline |
+| vector | `hnsw-f32` | production HNSW cosine ANN |
+| vector | `hnsw-i8` | memory-efficient quantized HNSW |
+| vector | `exact` | exact cosine recall/reference baseline |
+
+This makes it possible to measure ANN recall and quantization trade-offs against exact retrieval without changing AQF.
+
+## Run the server
 
 ```bash
 docker compose up --build
 ```
 
-Server: `http://localhost:7777`
+Server:
 
-### Upsert
+```text
+http://localhost:7777
+```
+
+Health includes the active backends:
+
+```bash
+curl http://localhost:7777/health
+```
+
+Example response:
+
+```json
+{
+  "status": "ok",
+  "engine": "QueryWeave",
+  "version": "0.1.0",
+  "lexical_backend": "tantivy-bm25",
+  "vector_backend": "usearch-hnsw-f32"
+}
+```
+
+### Index documents
 
 ```bash
 curl -X POST http://localhost:7777/v1/documents:upsert \
   -H 'content-type: application/json' \
-  -d '{"documents":[{"id":"1","text":"pump failure","source":"manual"}]}'
+  -d '{
+    "documents": [
+      {
+        "id": "doc-1",
+        "text": "Hydraulic pump temperature failure",
+        "source": "manual.pdf"
+      }
+    ]
+  }'
 ```
 
 ### Search
@@ -138,15 +170,45 @@ curl -X POST http://localhost:7777/v1/documents:upsert \
 ```bash
 curl -X POST http://localhost:7777/v1/search \
   -H 'content-type: application/json' \
-  -d '{"query":"pump failure","limit":5,"mode":"auto","explain":true}'
+  -d '{
+    "query": "prevent pump failure caused by excessive heat",
+    "limit": 10,
+    "mode": "auto",
+    "explain": true
+  }'
 ```
 
-## Python native engine
+## External vectors for fair benchmarking
+
+For serious hybrid search, pass the same production vectors used by competing engines:
+
+```json
+{
+  "query": "industrial pump failure",
+  "dense": [0.12, -0.08, 0.31],
+  "sparse": {
+    "indices": [44, 901],
+    "values": [1.7, 0.8]
+  },
+  "limit": 10,
+  "mode": "auto",
+  "filter": {"language": "en"},
+  "explain": true
+}
+```
+
+This contract is central to QueryWeave benchmarking: QueryWeave, Qdrant and Elasticsearch can receive the **same chunks, BGE vectors and SPLADE vectors** rather than accidentally benchmarking different representation models.
+
+## Python: native engine + ML plugins
+
+Build the PyO3 extension:
 
 ```bash
-python -m pip install maturin
+python -m pip install 'maturin>=1.9,<2.0'
 maturin develop
 ```
+
+Use external dense/sparse models:
 
 ```python
 from queryweave import QueryWeave
@@ -165,7 +227,11 @@ engine.upsert([
 result = engine.search("prevent industrial pump failure")
 ```
 
-A reranker only needs to implement:
+The native Python extension intentionally uses the dependency-light core backends. For the production Tantivy/HNSW configuration from Python, use `QueryWeaveClient` against the server while still generating BGE/SPLADE vectors in Python.
+
+### Reranker plugins
+
+A Python reranker only needs:
 
 ```python
 class MyReranker:
@@ -173,49 +239,105 @@ class MyReranker:
         ...
 ```
 
-so ColBERT/MaxSim, cross-encoders, LLM rerankers and enterprise APIs can be swapped without recompiling the Rust engine.
+This lets research code integrate:
 
-## External-vector contract
+- ColBERT / MaxSim;
+- cross-encoders;
+- ONNX rankers;
+- LLM rerankers;
+- remote enterprise ranking APIs.
 
-QueryWeave accepts dense and sparse vectors in both documents and queries. This is important for fair evaluation: Qdrant, Elasticsearch and QueryWeave can receive **the same BGE/SPLADE vectors** rather than accidentally benchmarking different models.
+## Rust API
+
+The core defaults to lightweight correctness backends:
+
+```rust
+use queryweave_core::{
+    Document, Metadata, QueryWeaveEngine, SearchMode, SearchRequest,
+};
+
+let engine = QueryWeaveEngine::new();
+
+engine.upsert(vec![Document {
+    id: "doc-1".into(),
+    text: "Hydraulic pump temperature failure".into(),
+    source: "manual.pdf".into(),
+    metadata: Metadata::new(),
+    dense: None,
+    sparse: None,
+}]);
+
+let result = engine.search(SearchRequest {
+    query: "pump failure".into(),
+    limit: 10,
+    mode: SearchMode::Auto,
+    dense: None,
+    sparse: None,
+    filter: Metadata::new(),
+    explain: true,
+});
+```
+
+Production applications can construct `QueryWeaveEngine::with_backends(...)` with `TantivyLexicalIndex` and `USearchHnswIndex`.
+
+## Explainability
+
+A QueryWeave hit can expose:
 
 ```json
 {
-  "query": "industrial pump failure",
-  "dense": [0.12, -0.08, 0.31],
-  "sparse": {"indices": [44, 901], "values": [1.7, 0.8]},
-  "limit": 10,
-  "mode": "auto",
-  "filter": {"language": "en"},
-  "explain": true
+  "score": 0.894,
+  "components": {
+    "lexical": 0.73,
+    "sparse": 0.84,
+    "dense": 0.91,
+    "rerank": 0.0
+  },
+  "explanation": {
+    "route": "hybrid",
+    "weights": {
+      "lexical": 0.24,
+      "sparse": 0.31,
+      "dense": 0.45
+    },
+    "early_exit": false,
+    "reranked": false,
+    "lexical_backend": "tantivy-bm25",
+    "vector_backend": "usearch-hnsw-f32"
+  }
 }
 ```
 
-## Benchmark matrix
+## Benchmark design
 
-The recommended benchmark compares retrieval algorithms separately before comparing products:
+Do not benchmark only product names. First isolate the algorithms:
 
-| ID | Retrieval method |
+| ID | Method |
 |---|---|
 | A | BM25 only |
 | B | Dense only |
 | C | Sparse only |
 | D | BM25 + Dense RRF |
-| E | BM25 + Sparse + Dense fixed fusion |
+| E | lexical + sparse + dense fixed fusion |
 | F | **QueryWeave AQF** |
-| G | AQF + always-on reranker |
+| G | AQF + always-on reranking |
 | H | **AQF + adaptive reranking** |
+| I | AQF + exact cosine |
+| J | AQF + HNSW F32 |
+| K | AQF + HNSW I8 |
 
-Then compare product implementations under the same corpus, chunks and vectors:
+Then compare engines using identical corpus/chunks/vectors:
 
-- QueryWeave
-- Qdrant
-- Elasticsearch
-- Vespa
-- LanceDB
-- Meilisearch
+- QueryWeave;
+- Qdrant;
+- Elasticsearch;
+- Vespa;
+- LanceDB;
+- Meilisearch.
 
-See `docs/BENCHMARKING.md`.
+The companion `vtavakkoli/Hybrid-Search` repository provides the first live comparison dashboard for **QueryWeave vs Qdrant vs Elasticsearch**.
+
+Recommended datasets include BEIR NFCorpus, SciFact, FiQA, TREC-COVID, ArguAna and DBPedia, with MS MARCO for larger-scale throughput experiments.
 
 ## Metrics
 
@@ -226,35 +348,33 @@ Quality:
 - Recall@100
 - MAP
 
-Performance:
+Efficiency:
 
 - p50 / p95 / p99 latency
-- throughput (QPS)
+- QPS
 - ingestion docs/s
-- RAM
+- resident RAM
 - index size
 - CPU/query
 - reranker invocation rate
+- HNSW recall vs exact
+- F32 vs I8 memory/quality trade-off
 
-The flagship result should be a **quality-versus-cost Pareto frontier**, not a claim that one engine is universally faster.
+The main scientific target is the **quality-versus-cost Pareto frontier**, not an unsupported claim that one engine is universally faster.
 
 ## Workspace
 
 ```text
 crates/
-  queryweave-core/      adaptive retrieval/fusion engine
-  queryweave-server/    Axum REST API
-  queryweave-python/    PyO3 extension
-python/queryweave/      Python SDK + model plugin protocols
-benchmarks/             quality/latency evaluation utilities
-docs/                   architecture and benchmark methodology
+  queryweave-core/       AQF, routing, filtering, explanations, baseline backends
+  queryweave-tantivy/    Tantivy BM25 backend
+  queryweave-usearch/    USearch HNSW F32/I8 backend
+  queryweave-server/     Axum HTTP service
+  queryweave-python/     PyO3 extension
+python/queryweave/       HTTP SDK + ML plugin protocols
+benchmarks/              normalized quality/latency evaluator
+docs/                    architecture and benchmark methodology
 ```
-
-## Current backend status
-
-QueryWeave v0.1 intentionally uses an **exact dense vector backend** as the built-in reference because it gives deterministic recall and a clean correctness baseline. The `VectorIndex` trait is the stable seam for HNSW, IVF/PQ, USearch or hardware-specific ANN backends. Likewise, production SPLADE and ColBERT live behind plugin contracts rather than being hard-coded into the Rust core.
-
-This separation is deliberate: retrieval-policy experiments should not be confounded by one mandatory ML runtime.
 
 ## Development
 
@@ -264,12 +384,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Python:
+Python wheel:
 
 ```bash
-python -m pip install -e '.[dev]'
-maturin develop
-pytest
+maturin build --release
 ```
 
 ## License
