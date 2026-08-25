@@ -93,7 +93,7 @@ impl LexicalRetriever for TantivyLexicalIndex {
         ) else {
             return Vec::new();
         };
-        if eligible.is_empty() {
+        if eligible.is_empty() || limit == 0 {
             return Vec::new();
         }
 
@@ -102,8 +102,13 @@ impl LexicalRetriever for TantivyLexicalIndex {
             return Vec::new();
         };
         let searcher = reader.searcher();
-        let candidate_limit = (limit.max(1) * 8).min(searcher.num_docs() as usize);
-        let Ok(top_docs) = searcher.search(&parsed, &TopDocs::with_limit(candidate_limit)) else {
+        let num_docs = searcher.num_docs() as usize;
+        if num_docs == 0 {
+            return Vec::new();
+        }
+        let candidate_limit = (limit.max(1) * 8).min(num_docs).max(1);
+        let collector = TopDocs::with_limit(candidate_limit).order_by_score();
+        let Ok(top_docs) = searcher.search(&parsed, &collector) else {
             return Vec::new();
         };
 
@@ -165,5 +170,13 @@ mod tests {
         let hits = index.search("CVE-2026-12345", &eligible, 2);
         assert_eq!(hits.first().map(|hit| hit.0), Some(0));
         assert_eq!(index.name(), "tantivy-bm25");
+    }
+
+    #[test]
+    fn zero_limit_returns_no_hits() {
+        let mut index = TantivyLexicalIndex::default();
+        index.rebuild(&[document("a", "rust hybrid search")]);
+        let eligible = HashSet::from([0usize]);
+        assert!(index.search("rust", &eligible, 0).is_empty());
     }
 }
