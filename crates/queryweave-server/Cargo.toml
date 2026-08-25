@@ -1,0 +1,16 @@
+[package]
+name = "queryweave-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "HTTP service for the QueryWeave adaptive hybrid retrieval engine"
+
+[dependencies]
+queryweave-core = { path = "../queryweave-core" }
+axum = "0.8.9"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "net", "signal"] }
+serde.workspace = true
+serde_json.workspace = true

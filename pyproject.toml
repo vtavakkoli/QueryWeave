@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "queryweave"
+version = "0.1.0"
+description = "Python SDK and plugin layer for the QueryWeave Rust adaptive hybrid retrieval engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Vahid Tavakkoli" }]
+keywords = ["search", "hybrid-search", "rust", "bm25", "vector-search", "retrieval", "rag"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Text Processing :: Indexing",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+plugins = ["fastembed>=0.7"]
+dev = ["pytest>=8.3", "maturin>=1.9"]
+
+[tool.maturin]
+manifest-path = "crates/queryweave-python/Cargo.toml"
+python-source = "python"
+module-name = "queryweave._native"
+features = ["pyo3/extension-module"]
