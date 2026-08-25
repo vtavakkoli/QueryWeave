@@ -1,0 +1,13 @@
+[package]
+name = "queryweave-tantivy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tantivy BM25 lexical backend for QueryWeave"
+
+[dependencies]
+queryweave-core = { path = "../queryweave-core" }
+tantivy = "0.26.1"
