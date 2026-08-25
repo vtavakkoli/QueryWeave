@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 //! QueryWeave core: adaptive lexical + sparse + dense retrieval with explainable fusion.
 //!
-//! The default implementation is deliberately dependency-light and deterministic. Production
-//! deployments can replace the exact dense backend, encoders, and reranker through the public
-//! traits without changing the query/fusion contract.
+//! Retrieval backends are runtime-swappable. The built-in BM25-style and exact-cosine backends
+//! are deterministic correctness baselines; production crates can provide Tantivy and HNSW/ANN
+//! implementations without changing AQF, filtering, explanations, or the public search contract.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -124,6 +124,8 @@ pub struct Explanation {
     pub reranked: bool,
     pub reranker: String,
     pub candidate_pool: usize,
+    pub lexical_backend: String,
+    pub vector_backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +154,8 @@ pub struct EngineStats {
     pub dense_dimensions: usize,
     pub lexical_terms: usize,
     pub sparse_dimensions_observed: usize,
+    pub lexical_backend: String,
+    pub vector_backend: String,
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +172,21 @@ pub trait SparseEncoder: Send + Sync {
     fn encode_sparse(&self, text: &str) -> SparseVector;
 }
 
+pub trait LexicalRetriever: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn rebuild(&mut self, documents: &[Document]);
+    fn search(
+        &self,
+        query: &str,
+        eligible: &HashSet<usize>,
+        limit: usize,
+    ) -> Vec<(usize, f32)>;
+    fn rare_ratio(&self, query: &str) -> f32;
+    fn term_count(&self) -> usize;
+}
+
 pub trait VectorIndex: Send + Sync {
+    fn name(&self) -> &'static str;
     fn rebuild(&mut self, documents: &[Document]);
     fn search(
         &self,
@@ -241,6 +259,10 @@ pub struct ExactVectorIndex {
 }
 
 impl VectorIndex for ExactVectorIndex {
+    fn name(&self) -> &'static str {
+        "exact-cosine"
+    }
+
     fn rebuild(&mut self, documents: &[Document]) {
         self.dimensions = documents
             .iter()
@@ -277,14 +299,18 @@ impl VectorIndex for ExactVectorIndex {
 }
 
 #[derive(Debug, Clone, Default)]
-struct LexicalIndex {
+pub struct BuiltinBm25Index {
     doc_terms: Vec<HashMap<String, usize>>,
     doc_lengths: Vec<usize>,
     df: HashMap<String, usize>,
     avg_len: f32,
 }
 
-impl LexicalIndex {
+impl LexicalRetriever for BuiltinBm25Index {
+    fn name(&self) -> &'static str {
+        "builtin-bm25"
+    }
+
     fn rebuild(&mut self, documents: &[Document]) {
         self.doc_terms.clear();
         self.doc_lengths.clear();
@@ -312,7 +338,12 @@ impl LexicalIndex {
         };
     }
 
-    fn search(&self, query: &str, eligible: &HashSet<usize>, limit: usize) -> Vec<ScoredDoc> {
+    fn search(
+        &self,
+        query: &str,
+        eligible: &HashSet<usize>,
+        limit: usize,
+    ) -> Vec<(usize, f32)> {
         let query_terms = tokenize(query);
         let document_count = self.doc_terms.len() as f32;
         let mut results = Vec::new();
@@ -346,29 +377,21 @@ impl LexicalIndex {
             }
 
             if score > 0.0 {
-                results.push(ScoredDoc {
-                    doc_idx: index,
-                    score,
-                });
+                results.push((index, score));
             }
         }
 
-        results.sort_by(|left, right| right.score.total_cmp(&left.score));
+        results.sort_by(|left, right| right.1.total_cmp(&left.1));
         results.truncate(limit);
         results
     }
 
     fn rare_ratio(&self, query: &str) -> f32 {
-        let query_terms = tokenize(query);
-        if query_terms.is_empty() || self.doc_terms.is_empty() {
-            return 0.0;
-        }
-        let threshold = ((self.doc_terms.len() as f32) * 0.05).ceil() as usize;
-        query_terms
-            .iter()
-            .filter(|term| self.df.get(*term).copied().unwrap_or(0) <= threshold.max(1))
-            .count() as f32
-            / query_terms.len() as f32
+        rare_ratio_from_df(query, &self.df, self.doc_terms.len())
+    }
+
+    fn term_count(&self) -> usize {
+        self.df.len()
     }
 }
 
@@ -405,17 +428,13 @@ impl Reranker for BuiltinLateInteractionReranker {
 }
 
 #[derive(Default)]
-struct State {
+struct CorpusState {
     documents: Vec<Document>,
-    lexical: LexicalIndex,
-    dense: ExactVectorIndex,
     sparse_dimensions_observed: usize,
 }
 
-impl State {
-    fn rebuild(&mut self) {
-        self.lexical.rebuild(&self.documents);
-        self.dense.rebuild(&self.documents);
+impl CorpusState {
+    fn refresh_sparse_stats(&mut self) {
         let mut dimensions = HashSet::new();
         for document in &self.documents {
             if let Some(sparse) = &document.sparse {
@@ -427,7 +446,9 @@ impl State {
 }
 
 pub struct QueryWeaveEngine {
-    state: RwLock<State>,
+    state: RwLock<CorpusState>,
+    lexical: RwLock<Box<dyn LexicalRetriever>>,
+    dense: RwLock<Box<dyn VectorIndex>>,
     embedder: Box<dyn Embedder>,
     sparse_encoder: Box<dyn SparseEncoder>,
 }
@@ -440,19 +461,36 @@ impl Default for QueryWeaveEngine {
 
 impl QueryWeaveEngine {
     pub fn new() -> Self {
-        Self {
-            state: RwLock::new(State::default()),
-            embedder: Box::new(HashEmbedder::default()),
-            sparse_encoder: Box::new(HashSparseEncoder),
-        }
+        Self::with_backends(
+            Box::new(BuiltinBm25Index::default()),
+            Box::new(ExactVectorIndex::default()),
+            Box::new(HashEmbedder::default()),
+            Box::new(HashSparseEncoder),
+        )
     }
 
     pub fn with_encoders(
         embedder: Box<dyn Embedder>,
         sparse_encoder: Box<dyn SparseEncoder>,
     ) -> Self {
+        Self::with_backends(
+            Box::new(BuiltinBm25Index::default()),
+            Box::new(ExactVectorIndex::default()),
+            embedder,
+            sparse_encoder,
+        )
+    }
+
+    pub fn with_backends(
+        lexical: Box<dyn LexicalRetriever>,
+        dense: Box<dyn VectorIndex>,
+        embedder: Box<dyn Embedder>,
+        sparse_encoder: Box<dyn SparseEncoder>,
+    ) -> Self {
         Self {
-            state: RwLock::new(State::default()),
+            state: RwLock::new(CorpusState::default()),
+            lexical: RwLock::new(lexical),
+            dense: RwLock::new(dense),
             embedder,
             sparse_encoder,
         }
@@ -484,22 +522,50 @@ impl QueryWeaveEngine {
                 state.documents.push(document);
             }
         }
-        state.rebuild();
+        state.refresh_sparse_stats();
+
+        self.lexical
+            .write()
+            .expect("queryweave lexical backend poisoned")
+            .rebuild(&state.documents);
+        self.dense
+            .write()
+            .expect("queryweave vector backend poisoned")
+            .rebuild(&state.documents);
         count
     }
 
     pub fn reset(&self) {
         let mut state = self.state.write().expect("queryweave state poisoned");
-        *state = State::default();
+        state.documents.clear();
+        state.sparse_dimensions_observed = 0;
+        self.lexical
+            .write()
+            .expect("queryweave lexical backend poisoned")
+            .rebuild(&[]);
+        self.dense
+            .write()
+            .expect("queryweave vector backend poisoned")
+            .rebuild(&[]);
     }
 
     pub fn stats(&self) -> EngineStats {
         let state = self.state.read().expect("queryweave state poisoned");
+        let lexical = self
+            .lexical
+            .read()
+            .expect("queryweave lexical backend poisoned");
+        let dense = self
+            .dense
+            .read()
+            .expect("queryweave vector backend poisoned");
         EngineStats {
             documents: state.documents.len(),
-            dense_dimensions: state.dense.dimensions(),
-            lexical_terms: state.lexical.df.len(),
+            dense_dimensions: dense.dimensions(),
+            lexical_terms: lexical.term_count(),
             sparse_dimensions_observed: state.sparse_dimensions_observed,
+            lexical_backend: lexical.name().into(),
+            vector_backend: dense.name().into(),
         }
     }
 
@@ -535,9 +601,19 @@ impl QueryWeaveEngine {
             .map(|(index, _)| index)
             .collect();
 
-        let lexical = state
-            .lexical
-            .search(&request.query, &eligible, candidate_limit);
+        let (lexical, rare_ratio, lexical_backend) = {
+            let backend = self
+                .lexical
+                .read()
+                .expect("queryweave lexical backend poisoned");
+            let scores = backend
+                .search(&request.query, &eligible, candidate_limit)
+                .into_iter()
+                .map(|(doc_idx, score)| ScoredDoc { doc_idx, score })
+                .collect();
+            (scores, backend.rare_ratio(&request.query), backend.name())
+        };
+
         let query_dense = request
             .dense
             .clone()
@@ -547,12 +623,18 @@ impl QueryWeaveEngine {
             .clone()
             .unwrap_or_else(|| self.sparse_encoder.encode_sparse(&request.query))
             .normalized();
-        let dense: Vec<ScoredDoc> = state
-            .dense
-            .search(&query_dense, &eligible, candidate_limit)
-            .into_iter()
-            .map(|(doc_idx, score)| ScoredDoc { doc_idx, score })
-            .collect();
+        let (dense, vector_backend) = {
+            let backend = self
+                .dense
+                .read()
+                .expect("queryweave vector backend poisoned");
+            let scores = backend
+                .search(&query_dense, &eligible, candidate_limit)
+                .into_iter()
+                .map(|(doc_idx, score)| ScoredDoc { doc_idx, score })
+                .collect();
+            (scores, backend.name())
+        };
         let sparse = sparse_search(
             &state.documents,
             &query_sparse,
@@ -564,7 +646,7 @@ impl QueryWeaveEngine {
         let lexical_margin = score_margin(&lexical);
         let features = query_features(
             &request.query,
-            state.lexical.rare_ratio(&request.query),
+            rare_ratio,
             lexical_margin,
             retriever_disagreement,
         );
@@ -614,6 +696,8 @@ impl QueryWeaveEngine {
                             reranked: false,
                             reranker: "none".into(),
                             candidate_pool: candidate_limit,
+                            lexical_backend: lexical_backend.into(),
+                            vector_backend: vector_backend.into(),
                         })
                     } else {
                         None
@@ -622,8 +706,7 @@ impl QueryWeaveEngine {
             })
             .collect();
 
-        let should_rerank = route == "deep" && !hits.is_empty();
-        if should_rerank {
+        if route == "deep" && !hits.is_empty() {
             if let Some(custom) = reranker {
                 custom.rerank(&request.query, &mut hits);
                 mark_reranked(&mut hits, custom.name());
@@ -888,11 +971,28 @@ fn matches_filter(document: &Document, filter: &Metadata) -> bool {
     })
 }
 
-fn tokenize(text: &str) -> Vec<String> {
+pub fn simple_tokenize(text: &str) -> Vec<String> {
     text.split(|character: char| !character.is_alphanumeric() && character != '_' && character != '-')
         .filter(|token| !token.is_empty())
         .map(str::to_lowercase)
         .collect()
+}
+
+pub fn rare_ratio_from_df(query: &str, df: &HashMap<String, usize>, document_count: usize) -> f32 {
+    let query_terms = simple_tokenize(query);
+    if query_terms.is_empty() || document_count == 0 {
+        return 0.0;
+    }
+    let threshold = ((document_count as f32) * 0.05).ceil() as usize;
+    query_terms
+        .iter()
+        .filter(|term| df.get(*term).copied().unwrap_or(0) <= threshold.max(1))
+        .count() as f32
+        / query_terms.len() as f32
+}
+
+fn tokenize(text: &str) -> Vec<String> {
+    simple_tokenize(text)
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {
@@ -965,6 +1065,7 @@ mod tests {
         });
         assert_eq!(response.hits[0].id, "a");
         assert!(response.route.contains("lexical") || response.route == "hybrid");
+        assert_eq!(response.hits[0].explanation.as_ref().unwrap().lexical_backend, "builtin-bm25");
     }
 
     #[test]
