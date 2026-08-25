@@ -6,7 +6,13 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use queryweave_core::{Document, EngineStats, QueryWeaveEngine, SearchRequest, SearchResponse};
+use queryweave_core::{
+    BuiltinBm25Index, Document, EngineStats, ExactVectorIndex, HashEmbedder,
+    HashSparseEncoder, LexicalRetriever, QueryWeaveEngine, SearchRequest, SearchResponse,
+    VectorIndex,
+};
+use queryweave_tantivy::TantivyLexicalIndex;
+use queryweave_usearch::USearchHnswIndex;
 use serde::{Deserialize, Serialize};
 use std::{env, sync::Arc};
 
@@ -31,12 +37,38 @@ struct HealthResponse {
     status: &'static str,
     engine: &'static str,
     version: &'static str,
+    lexical_backend: String,
+    vector_backend: String,
+}
+
+fn build_engine() -> QueryWeaveEngine {
+    let lexical_name =
+        env::var("QUERYWEAVE_LEXICAL_BACKEND").unwrap_or_else(|_| "tantivy".into());
+    let vector_name =
+        env::var("QUERYWEAVE_VECTOR_BACKEND").unwrap_or_else(|_| "hnsw-f32".into());
+
+    let lexical: Box<dyn LexicalRetriever> = match lexical_name.as_str() {
+        "builtin" | "bm25" => Box::new(BuiltinBm25Index::default()),
+        _ => Box::new(TantivyLexicalIndex::default()),
+    };
+    let vector: Box<dyn VectorIndex> = match vector_name.as_str() {
+        "exact" => Box::new(ExactVectorIndex::default()),
+        "hnsw-i8" | "i8" => Box::new(USearchHnswIndex::i8()),
+        _ => Box::new(USearchHnswIndex::f32()),
+    };
+
+    QueryWeaveEngine::with_backends(
+        lexical,
+        vector,
+        Box::new(HashEmbedder::default()),
+        Box::new(HashSparseEncoder),
+    )
 }
 
 #[tokio::main]
 async fn main() {
     let state = AppState {
-        engine: Arc::new(QueryWeaveEngine::new()),
+        engine: Arc::new(build_engine()),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -57,11 +89,14 @@ async fn main() {
         .expect("QueryWeave server failed");
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let stats = state.engine.stats();
     Json(HealthResponse {
         status: "ok",
         engine: "QueryWeave",
         version: env!("CARGO_PKG_VERSION"),
+        lexical_backend: stats.lexical_backend,
+        vector_backend: stats.vector_backend,
     })
 }
 
