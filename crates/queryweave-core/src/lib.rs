@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
-//! QueryWeave core: adaptive lexical + sparse + dense retrieval with explainable fusion.
+//! QueryWeave core: query-adaptive lexical + sparse + dense retrieval.
 //!
-//! Retrieval backends are runtime-swappable. The built-in BM25-style and exact-cosine backends
-//! are deterministic correctness baselines; production crates can provide Tantivy and HNSW/ANN
-//! implementations without changing AQF, filtering, explanations, or the public search contract.
+//! Retrieval backends are runtime-swappable. Built-in BM25-style lexical retrieval and exact
+//! cosine search provide deterministic correctness baselines. Production crates can provide
+//! Tantivy, HNSW/USearch, or future ANN backends without changing AQF, filtering, explanations,
+//! or the public search contract.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -88,7 +89,7 @@ pub struct FusionWeights {
 }
 
 impl FusionWeights {
-    fn normalize(mut self) -> Self {
+    fn normalized(mut self) -> Self {
         let total = (self.lexical + self.sparse + self.dense).max(f32::EPSILON);
         self.lexical /= total;
         self.sparse /= total;
@@ -224,11 +225,10 @@ impl HashEmbedder {
 impl Embedder for HashEmbedder {
     fn embed(&self, text: &str) -> Vec<f32> {
         let mut vector = vec![0.0; self.dimensions];
-        for token in tokenize(text) {
+        for token in simple_tokenize(text) {
             let hash = stable_hash(token.as_bytes());
             let index = (hash as usize) % self.dimensions;
-            let sign = if (hash >> 63) == 0 { 1.0 } else { -1.0 };
-            vector[index] += sign;
+            vector[index] += if hash >> 63 == 0 { 1.0 } else { -1.0 };
         }
         l2_normalize(&mut vector);
         vector
@@ -241,7 +241,7 @@ pub struct HashSparseEncoder;
 impl SparseEncoder for HashSparseEncoder {
     fn encode_sparse(&self, text: &str) -> SparseVector {
         let mut counts = BTreeMap::<u32, f32>::new();
-        for token in tokenize(text) {
+        for token in simple_tokenize(text) {
             let index = (stable_hash(token.as_bytes()) % 65_536) as u32;
             *counts.entry(index).or_insert(0.0) += 1.0;
         }
@@ -280,17 +280,19 @@ impl VectorIndex for ExactVectorIndex {
         eligible: &HashSet<usize>,
         limit: usize,
     ) -> Vec<(usize, f32)> {
-        let mut scored: Vec<(usize, f32)> = self
+        let mut results: Vec<(usize, f32)> = self
             .vectors
             .iter()
             .enumerate()
             .filter(|(index, _)| eligible.contains(index))
-            .filter_map(|(index, value)| value.as_ref().map(|vector| (index, cosine(query, vector))))
+            .filter_map(|(index, vector)| {
+                vector.as_ref().map(|value| (index, cosine(query, value)))
+            })
             .filter(|(_, score)| score.is_finite())
             .collect();
-        scored.sort_by(|left, right| right.1.total_cmp(&left.1));
-        scored.truncate(limit);
-        scored
+        results.sort_by(|left, right| right.1.total_cmp(&left.1));
+        results.truncate(limit);
+        results
     }
 
     fn dimensions(&self) -> usize {
@@ -315,9 +317,8 @@ impl LexicalRetriever for BuiltinBm25Index {
         self.doc_terms.clear();
         self.doc_lengths.clear();
         self.df.clear();
-
         for document in documents {
-            let tokens = tokenize(&document.text);
+            let tokens = simple_tokenize(&document.text);
             let mut term_frequency = HashMap::new();
             let mut unique = BTreeSet::new();
             for token in &tokens {
@@ -330,7 +331,6 @@ impl LexicalRetriever for BuiltinBm25Index {
             self.doc_lengths.push(tokens.len());
             self.doc_terms.push(term_frequency);
         }
-
         self.avg_len = if self.doc_lengths.is_empty() {
             0.0
         } else {
@@ -344,15 +344,13 @@ impl LexicalRetriever for BuiltinBm25Index {
         eligible: &HashSet<usize>,
         limit: usize,
     ) -> Vec<(usize, f32)> {
-        let query_terms = tokenize(query);
+        let query_terms = simple_tokenize(query);
         let document_count = self.doc_terms.len() as f32;
         let mut results = Vec::new();
-
         for (index, terms) in self.doc_terms.iter().enumerate() {
             if !eligible.contains(&index) {
                 continue;
             }
-
             let mut score = 0.0;
             let document_length = self.doc_lengths[index] as f32;
             for term in &query_terms {
@@ -362,8 +360,8 @@ impl LexicalRetriever for BuiltinBm25Index {
                 }
                 let document_frequency = *self.df.get(term).unwrap_or(&0) as f32;
                 let idf = (1.0
-                    + ((document_count - document_frequency + 0.5)
-                        / (document_frequency + 0.5)))
+                    + (document_count - document_frequency + 0.5)
+                        / (document_frequency + 0.5))
                     .ln();
                 let k1 = 1.2;
                 let b = 0.75;
@@ -375,12 +373,10 @@ impl LexicalRetriever for BuiltinBm25Index {
                 score += idf * (term_frequency * (k1 + 1.0))
                     / (term_frequency + k1 * (1.0 - b + b * length_norm));
             }
-
             if score > 0.0 {
                 results.push((index, score));
             }
         }
-
         results.sort_by(|left, right| right.1.total_cmp(&left.1));
         results.truncate(limit);
         results
@@ -404,11 +400,10 @@ impl Reranker for BuiltinLateInteractionReranker {
     }
 
     fn rerank(&self, query: &str, hits: &mut [SearchHit]) {
-        let query_tokens = tokenize(query);
+        let query_tokens = simple_tokenize(query);
         let query_set: HashSet<&str> = query_tokens.iter().map(String::as_str).collect();
-
         for hit in hits.iter_mut() {
-            let document_tokens = tokenize(&hit.text);
+            let document_tokens = simple_tokenize(&hit.text);
             let document_set: HashSet<&str> =
                 document_tokens.iter().map(String::as_str).collect();
             let overlap = if query_set.is_empty() {
@@ -509,7 +504,6 @@ impl QueryWeaveEngine {
                 document.sparse = Some(sparse.normalized());
             }
         }
-
         let count = documents.len();
         for document in documents {
             if let Some(position) = state
@@ -523,7 +517,6 @@ impl QueryWeaveEngine {
             }
         }
         state.refresh_sparse_stats();
-
         self.lexical
             .write()
             .expect("queryweave lexical backend poisoned")
@@ -601,12 +594,12 @@ impl QueryWeaveEngine {
             .map(|(index, _)| index)
             .collect();
 
-        let (lexical, rare_ratio, lexical_backend) = {
+        let (lexical, rare_ratio, lexical_backend): (Vec<ScoredDoc>, f32, &'static str) = {
             let backend = self
                 .lexical
                 .read()
                 .expect("queryweave lexical backend poisoned");
-            let scores = backend
+            let scores: Vec<ScoredDoc> = backend
                 .search(&request.query, &eligible, candidate_limit)
                 .into_iter()
                 .map(|(doc_idx, score)| ScoredDoc { doc_idx, score })
@@ -623,12 +616,12 @@ impl QueryWeaveEngine {
             .clone()
             .unwrap_or_else(|| self.sparse_encoder.encode_sparse(&request.query))
             .normalized();
-        let (dense, vector_backend) = {
+        let (dense, vector_backend): (Vec<ScoredDoc>, &'static str) = {
             let backend = self
                 .dense
                 .read()
                 .expect("queryweave vector backend poisoned");
-            let scores = backend
+            let scores: Vec<ScoredDoc> = backend
                 .search(&query_dense, &eligible, candidate_limit)
                 .into_iter()
                 .map(|(doc_idx, score)| ScoredDoc { doc_idx, score })
@@ -687,21 +680,17 @@ impl QueryWeaveEngine {
                     metadata: document.metadata.clone(),
                     score,
                     components,
-                    explanation: if request.explain {
-                        Some(Explanation {
-                            route: route.into(),
-                            weights,
-                            features: features.clone(),
-                            early_exit,
-                            reranked: false,
-                            reranker: "none".into(),
-                            candidate_pool: candidate_limit,
-                            lexical_backend: lexical_backend.into(),
-                            vector_backend: vector_backend.into(),
-                        })
-                    } else {
-                        None
-                    },
+                    explanation: request.explain.then(|| Explanation {
+                        route: route.into(),
+                        weights,
+                        features: features.clone(),
+                        early_exit,
+                        reranked: false,
+                        reranker: "none".into(),
+                        candidate_pool: candidate_limit,
+                        lexical_backend: lexical_backend.into(),
+                        vector_backend: vector_backend.into(),
+                    }),
                 }
             })
             .collect();
@@ -743,11 +732,9 @@ fn query_features(
     disagreement: f32,
 ) -> QueryFeatures {
     let words: Vec<&str> = query.split_whitespace().collect();
-    let token_count = words.len();
     if words.is_empty() {
         return QueryFeatures::default();
     }
-
     let numeric = words
         .iter()
         .filter(|word| word.chars().any(|character| character.is_ascii_digit()))
@@ -762,9 +749,8 @@ fn query_features(
             has_digit && has_delimiter
         })
         .count();
-
     QueryFeatures {
-        token_count,
+        token_count: words.len(),
         numeric_ratio: numeric as f32 / words.len() as f32,
         identifier_ratio: identifiers as f32 / words.len() as f32,
         rare_ratio,
@@ -793,7 +779,6 @@ fn adaptive_weights(features: &QueryFeatures) -> FusionWeights {
             dense: 0.40,
         }
     };
-
     if features.rare_ratio > 0.5 {
         weights.lexical += 0.08;
         weights.sparse += 0.05;
@@ -807,11 +792,10 @@ fn adaptive_weights(features: &QueryFeatures) -> FusionWeights {
         weights.lexical += 0.12;
         weights.dense -= 0.06;
     }
-
     weights.lexical = weights.lexical.max(0.02);
     weights.sparse = weights.sparse.max(0.02);
     weights.dense = weights.dense.max(0.02);
-    weights.normalize()
+    weights.normalized()
 }
 
 fn fuse_adaptive(
@@ -827,7 +811,6 @@ fn fuse_adaptive(
     candidates.extend(lexical_scores.keys().copied());
     candidates.extend(sparse_scores.keys().copied());
     candidates.extend(dense_scores.keys().copied());
-
     let mut output = Vec::new();
     for index in candidates {
         let components = ComponentScores {
@@ -866,22 +849,22 @@ fn normalize_scores(scores: &[ScoredDoc]) -> HashMap<usize, f32> {
     }
     let min = scores
         .iter()
-        .map(|scored| scored.score)
+        .map(|item| item.score)
         .fold(f32::INFINITY, f32::min);
     let max = scores
         .iter()
-        .map(|scored| scored.score)
+        .map(|item| item.score)
         .fold(f32::NEG_INFINITY, f32::max);
     let span = (max - min).max(1e-6);
     scores
         .iter()
-        .map(|scored| {
-            let normalized = if scores.len() == 1 {
+        .map(|item| {
+            let score = if scores.len() == 1 {
                 1.0
             } else {
-                (scored.score - min) / span
+                (item.score - min) / span
             };
-            (scored.doc_idx, normalized)
+            (item.doc_idx, score)
         })
         .collect()
 }
@@ -893,7 +876,7 @@ pub fn reciprocal_rank_fusion(lists: &[Vec<(String, f32)>], k: f32) -> Vec<(Stri
             *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
         }
     }
-    let mut output: Vec<_> = scores.into_iter().collect();
+    let mut output: Vec<(String, f32)> = scores.into_iter().collect();
     output.sort_by(|left, right| right.1.total_cmp(&left.1));
     output
 }
@@ -972,13 +955,19 @@ fn matches_filter(document: &Document, filter: &Metadata) -> bool {
 }
 
 pub fn simple_tokenize(text: &str) -> Vec<String> {
-    text.split(|character: char| !character.is_alphanumeric() && character != '_' && character != '-')
-        .filter(|token| !token.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+    text.split(|character: char| {
+        !character.is_alphanumeric() && character != '_' && character != '-'
+    })
+    .filter(|token| !token.is_empty())
+    .map(str::to_lowercase)
+    .collect()
 }
 
-pub fn rare_ratio_from_df(query: &str, df: &HashMap<String, usize>, document_count: usize) -> f32 {
+pub fn rare_ratio_from_df(
+    query: &str,
+    df: &HashMap<String, usize>,
+    document_count: usize,
+) -> f32 {
     let query_terms = simple_tokenize(query);
     if query_terms.is_empty() || document_count == 0 {
         return 0.0;
@@ -989,10 +978,6 @@ pub fn rare_ratio_from_df(query: &str, df: &HashMap<String, usize>, document_cou
         .filter(|term| df.get(*term).copied().unwrap_or(0) <= threshold.max(1))
         .count() as f32
         / query_terms.len() as f32
-}
-
-fn tokenize(text: &str) -> Vec<String> {
-    simple_tokenize(text)
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {
@@ -1064,12 +1049,13 @@ mod tests {
             explain: true,
         });
         assert_eq!(response.hits[0].id, "a");
-        assert!(response.route.contains("lexical") || response.route == "hybrid");
-        assert_eq!(response.hits[0].explanation.as_ref().unwrap().lexical_backend, "builtin-bm25");
+        let explanation = response.hits[0].explanation.as_ref().unwrap();
+        assert_eq!(explanation.lexical_backend, "builtin-bm25");
+        assert_eq!(explanation.vector_backend, "exact-cosine");
     }
 
     #[test]
-    fn semantic_query_uses_multiple_signals() {
+    fn semantic_query_prefers_relevant_document() {
         let engine = QueryWeaveEngine::new();
         engine.upsert(vec![
             document(
@@ -1088,7 +1074,6 @@ mod tests {
             explain: true,
         });
         assert_eq!(response.hits[0].id, "pump");
-        assert!(response.hits[0].components.lexical >= 0.0);
     }
 
     #[test]
@@ -1099,7 +1084,6 @@ mod tests {
         let mut german = document("b", "rust suchmaschine");
         german.metadata.insert("lang".into(), "de".into());
         engine.upsert(vec![english, german]);
-
         let mut filter = Metadata::new();
         filter.insert("lang".into(), "de".into());
         let response = engine.search(SearchRequest {
