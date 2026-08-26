@@ -1,14 +1,26 @@
 services:
   queryweave:
     build: .
+    init: true
     ports:
       - "7777:7777"
     environment:
       QUERYWEAVE_ADDR: 0.0.0.0:7777
       QUERYWEAVE_LEXICAL_BACKEND: ${QUERYWEAVE_LEXICAL_BACKEND:-tantivy}
       QUERYWEAVE_VECTOR_BACKEND: ${QUERYWEAVE_VECTOR_BACKEND:-hnsw-f32}
+      QUERYWEAVE_MAX_CONCURRENT_WORK: ${QUERYWEAVE_MAX_CONCURRENT_WORK:-8}
+      QUERYWEAVE_MAX_BODY_BYTES: ${QUERYWEAVE_MAX_BODY_BYTES:-33554432}
+      QUERYWEAVE_MAX_BATCH_DOCUMENTS: ${QUERYWEAVE_MAX_BATCH_DOCUMENTS:-10000}
+      QUERYWEAVE_MAX_QUERY_CHARS: ${QUERYWEAVE_MAX_QUERY_CHARS:-16384}
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7777"]
       interval: 10s
       timeout: 3s
       retries: 5
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    stop_grace_period: 15s

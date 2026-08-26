@@ -13,6 +13,6 @@ queryweave-core = { path = "../queryweave-core" }
 queryweave-tantivy = { path = "../queryweave-tantivy" }
 queryweave-usearch = { path = "../queryweave-usearch" }
 axum = "0.8.9"
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
 serde.workspace = true
 serde_json.workspace = true

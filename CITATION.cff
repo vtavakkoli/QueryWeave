@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use QueryWeave in research, please cite this software and the corresponding paper when available."
+title: "QueryWeave: Query-Adaptive Hybrid Retrieval Engine"
+type: software
+authors:
+  - family-names: Tavakkoli
+    given-names: Vahid
+version: 0.1.0
+date-released: 2026-08-25
+license: MIT
+repository-code: "https://github.com/vtavakkoli/QueryWeave"
+keywords:
+  - hybrid search
+  - information retrieval
+  - adaptive retrieval
+  - BM25
+  - vector search
+  - sparse retrieval
+  - retrieval augmented generation

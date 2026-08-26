@@ -1,6 +1,13 @@
 # QueryWeave
 
+[![CI](https://github.com/vtavakkoli/QueryWeave/actions/workflows/ci.yml/badge.svg)](https://github.com/vtavakkoli/QueryWeave/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
+
 **A Rust-first, query-adaptive hybrid retrieval engine for lexical, sparse, dense and neural search.**
+
+[Architecture](docs/ARCHITECTURE.md) · [Production & scaling](docs/PRODUCTION.md) · [Benchmarking](docs/BENCHMARKING.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 QueryWeave is designed around one research and engineering question:
 
@@ -22,11 +29,12 @@ Instead of applying one fixed hybrid formula to every query, QueryWeave analyzes
 - **Metadata pre-filtering**.
 - **Explainable results** including route, signal scores, AQF weights, backend names, confidence features and reranker decision.
 - **PyO3 native Python extension**.
-- **Pure-Python HTTP SDK**.
+- **Pure-Python HTTP SDK** with structured service/connection errors.
 - **Python model plugins** for dense encoders, learned sparse encoders and rerankers.
 - **FastEmbed BGE + SPLADE plugins** included as practical examples.
 - **Axum HTTP service** for Java/.NET/Go/Python/JS or remote consumers.
-- **Benchmark tooling** for nDCG, MRR, Recall, p50/p95/p99 latency and Pareto-frontier analysis.
+- **Bounded server concurrency and overload backpressure** for predictable behavior under load.
+- **Benchmark tooling** for nDCG, MRR, Recall, p50/p95/p99 latency, concurrent load and Pareto-frontier analysis.
 
 ## Architecture
 
@@ -131,7 +139,7 @@ Server:
 http://localhost:7777
 ```
 
-Health includes the active backends:
+Health includes the active backends and work-capacity information:
 
 ```bash
 curl http://localhost:7777/health
@@ -145,7 +153,9 @@ Example response:
   "engine": "QueryWeave",
   "version": "0.1.0",
   "lexical_backend": "tantivy-bm25",
-  "vector_backend": "usearch-hnsw-f32"
+  "vector_backend": "usearch-hnsw-f32",
+  "max_concurrent_work": 16,
+  "available_work_slots": 16
 }
 ```
 
@@ -177,6 +187,29 @@ curl -X POST http://localhost:7777/v1/search \
     "explain": true
   }'
 ```
+
+## Production and scalability
+
+The HTTP layer protects the async runtime by executing synchronous retrieval/index work on Tokio's blocking pool and bounds heavy operations with a configurable semaphore. When capacity is exhausted, QueryWeave returns `429` with the stable error code `server_busy` so callers can retry with bounded backoff instead of building an unbounded queue.
+
+Important capacity controls:
+
+```text
+QUERYWEAVE_MAX_CONCURRENT_WORK
+QUERYWEAVE_MAX_BODY_BYTES
+QUERYWEAVE_MAX_BATCH_DOCUMENTS
+QUERYWEAVE_MAX_QUERY_CHARS
+```
+
+The current indexes are process-local and in memory. Multiple replicas can scale read traffic when they are loaded with the same corpus/index generation, but QueryWeave does not yet provide automatic distributed sharding, durable replication, or shared-write coordination. See [Production & scaling](docs/PRODUCTION.md) for deployment guidance and explicit system boundaries.
+
+Run a dependency-free concurrent probe against a live server:
+
+```bash
+python benchmarks/load.py --seed-docs 1000 --requests 1000 --concurrency 16
+```
+
+The report includes QPS, p50/p95/p99/max latency, status counts, success rate, and the number of `429` load-shed responses.
 
 ## External vectors for fair benchmarking
 
@@ -228,6 +261,24 @@ result = engine.search("prevent industrial pump failure")
 ```
 
 The native Python extension intentionally uses the dependency-light core backends. For the production Tantivy/HNSW configuration from Python, use `QueryWeaveClient` against the server while still generating BGE/SPLADE vectors in Python.
+
+### HTTP SDK errors
+
+The dependency-free HTTP client exposes stable exception types:
+
+```python
+from queryweave import QueryWeaveClient, QueryWeaveHTTPError
+
+client = QueryWeaveClient("http://localhost:7777")
+
+try:
+    result = client.search("pump failure")
+except QueryWeaveHTTPError as exc:
+    if exc.code == "server_busy":
+        # retry with bounded exponential backoff + jitter
+        ...
+    raise
+```
 
 ### Reranker plugins
 
@@ -359,6 +410,7 @@ Efficiency:
 - reranker invocation rate
 - HNSW recall vs exact
 - F32 vs I8 memory/quality trade-off
+- overload / `429` rate under concurrency
 
 The main scientific target is the **quality-versus-cost Pareto frontier**, not an unsupported claim that one engine is universally faster.
 
@@ -372,8 +424,8 @@ crates/
   queryweave-server/     Axum HTTP service
   queryweave-python/     PyO3 extension
 python/queryweave/       HTTP SDK + ML plugin protocols
-benchmarks/              normalized quality/latency evaluator
-docs/                    architecture and benchmark methodology
+benchmarks/              quality/latency evaluator + concurrent load probe
+docs/                    architecture, benchmarking and production guidance
 ```
 
 ## Development
@@ -389,6 +441,12 @@ Python wheel:
 ```bash
 maturin build --release
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and benchmark requirements and [SECURITY.md](SECURITY.md) for vulnerability reporting/deployment security boundaries.
+
+## Citation
+
+Research users can cite the software metadata in [`CITATION.cff`](CITATION.cff). When a corresponding QueryWeave paper is available, cite both the software and the paper.
 
 ## License
 

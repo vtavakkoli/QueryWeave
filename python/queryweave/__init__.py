@@ -5,9 +5,23 @@ sparse, and reranking models remain Python plugins so research users can swap Fa
 SentenceTransformers, SPLADE, ColBERT, or proprietary models without recompiling Rust.
 """
 
-from .client import QueryWeaveClient
+from .client import (
+    QueryWeaveClient,
+    QueryWeaveConnectionError,
+    QueryWeaveError,
+    QueryWeaveHTTPError,
+)
 from .engine import QueryWeave
-from .plugins import EmbedderPlugin, SparseEncoderPlugin, RerankerPlugin
+from .plugins import EmbedderPlugin, RerankerPlugin, SparseEncoderPlugin
 
-__all__ = ["QueryWeave", "QueryWeaveClient", "EmbedderPlugin", "SparseEncoderPlugin", "RerankerPlugin"]
+__all__ = [
+    "QueryWeave",
+    "QueryWeaveClient",
+    "QueryWeaveError",
+    "QueryWeaveConnectionError",
+    "QueryWeaveHTTPError",
+    "EmbedderPlugin",
+    "SparseEncoderPlugin",
+    "RerankerPlugin",
+]
 __version__ = "0.1.0"
