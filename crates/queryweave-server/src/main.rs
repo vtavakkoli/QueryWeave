@@ -8,9 +8,8 @@ use axum::{
     Json, Router,
 };
 use queryweave_core::{
-    BuiltinBm25Index, Document, EngineStats, ExactVectorIndex, HashEmbedder,
-    HashSparseEncoder, LexicalRetriever, QueryWeaveEngine, SearchRequest, SearchResponse,
-    VectorIndex,
+    BuiltinBm25Index, Document, EngineStats, ExactVectorIndex, HashEmbedder, HashSparseEncoder,
+    LexicalRetriever, QueryWeaveEngine, SearchRequest, SearchResponse, VectorIndex,
 };
 use queryweave_tantivy::TantivyLexicalIndex;
 use queryweave_usearch::USearchHnswIndex;
@@ -154,10 +153,8 @@ impl IntoResponse for ApiError {
 }
 
 fn build_engine() -> Result<QueryWeaveEngine, String> {
-    let lexical_name =
-        env::var("QUERYWEAVE_LEXICAL_BACKEND").unwrap_or_else(|_| "tantivy".into());
-    let vector_name =
-        env::var("QUERYWEAVE_VECTOR_BACKEND").unwrap_or_else(|_| "hnsw-f32".into());
+    let lexical_name = env::var("QUERYWEAVE_LEXICAL_BACKEND").unwrap_or_else(|_| "tantivy".into());
+    let vector_name = env::var("QUERYWEAVE_VECTOR_BACKEND").unwrap_or_else(|_| "hnsw-f32".into());
 
     let lexical: Box<dyn LexicalRetriever> = match lexical_name.as_str() {
         "builtin" | "bm25" => Box::new(BuiltinBm25Index::default()),
