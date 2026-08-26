@@ -28,3 +28,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: python -m pip install 'maturin>=1.9,<2.0'
       - run: maturin build --release
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production image
+        run: docker build --tag queryweave:ci .
+      - name: Start QueryWeave
+        run: docker run --detach --name queryweave-ci --publish 7777:7777 queryweave:ci
+      - name: Verify health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:7777/health >/tmp/queryweave-health.json; then
+              cat /tmp/queryweave-health.json
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs queryweave-ci
+          exit 1
+      - name: Container logs
+        if: always()
+        run: docker logs queryweave-ci || true
