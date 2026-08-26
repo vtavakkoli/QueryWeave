@@ -360,8 +360,6 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn default_work_limit_scales_with_available_parallelism() {
         let workers = std::thread::available_parallelism()
