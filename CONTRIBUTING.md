@@ -62,7 +62,7 @@ Conventional-style subjects are encouraged, for example:
 feat(core): add learned fusion policy hook
 fix(server): preserve responsiveness under index rebuild
 perf(usearch): reduce filtered-search allocation
- docs: document benchmark methodology
+docs: document benchmark methodology
 ```
 
 ## Security issues
