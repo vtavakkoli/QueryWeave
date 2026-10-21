@@ -10,4 +10,4 @@ description = "Tantivy BM25 lexical backend for QueryWeave"
 
 [dependencies]
 queryweave-core = { path = "../queryweave-core" }
-tantivy = "0.26.1"
+tantivy = "0.27.0"
